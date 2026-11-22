@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db
+from .counts_api import router as counts_router
 from .gtfs import WEEKDAY_COLUMNS, format_gtfs_time, validate_version
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -22,6 +23,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="公交 GTFS 时刻表发布", lifespan=lifespan)
+app.include_router(counts_router)
 
 
 # ---------------- 发布 ----------------

@@ -49,6 +49,7 @@
 <header><h1>🚌 公交 GTFS 时刻表发布系统</h1></header>
 <nav>
   <button data-tab="query" class="active">时刻查询</button>
+  <button data-tab="counts">车门计数</button>
   <button data-tab="publish">发布新版本</button>
   <button data-tab="versions">版本记录</button>
 </nav>
@@ -71,6 +72,49 @@
     <button class="primary" id="q-btn">查询</button>
     <span class="muted" id="q-meta"></span>
     <div id="q-result"></div>
+  </div>
+</section>
+
+<!-- ============ 车门计数 ============ -->
+<section id="tab-counts" class="panel">
+  <div class="card">
+    <h2>上传逐站车门计数</h2>
+    <p class="muted">选择当前正式运行图和运营日开行的一趟班次，填写核载人数，
+       上传逐站计数 CSV（每个停站序号一行，上下车人数均为非负整数）。</p>
+    <div class="grid">
+      <div>
+        <label>运行图版本</label>
+        <select id="c-version"></select>
+      </div>
+      <div>
+        <label>运营日</label>
+        <input type="date" id="c-date">
+      </div>
+      <div>
+        <label>班次</label>
+        <select id="c-trip"></select>
+      </div>
+      <div>
+        <label>核载人数</label>
+        <input type="number" id="c-capacity" min="1" step="1" value="40">
+      </div>
+    </div>
+    <div class="grid">
+      <div>
+        <label>逐站计数 CSV</label>
+        <input type="file" id="c-file" accept=".csv">
+      </div>
+      <div>
+        <label>当前已存表</label>
+        <button class="primary" style="margin-top:0" id="c-load">查看当前计数表</button>
+      </div>
+    </div>
+    <button class="primary" id="c-submit">上传并核验（整表换交）</button>
+    <div id="c-msg"></div>
+  </div>
+  <div class="card" id="c-detail-card" style="display:none">
+    <h2 id="c-detail-title">计数明细</h2>
+    <div id="c-detail"></div>
   </div>
 </section>
 
@@ -115,6 +159,7 @@ document.querySelectorAll("nav button").forEach(btn => {
     $("tab-" + btn.dataset.tab).classList.add("active");
     if (btn.dataset.tab === "versions") loadVersions();
     if (btn.dataset.tab === "query") loadRoutes();
+    if (btn.dataset.tab === "counts") loadCountVersions();
   };
 });
 
@@ -221,6 +266,189 @@ async function showErrors(vid) {
     ${data.errors.map(e => `<tr><td>${e.file}</td><td>${e.row ?? "-"}</td>
       <td>${e.field ?? "-"}</td><td>${e.message}</td></tr>`).join("")}</table>`;
 }
+
+// ---------- 车门计数 ----------
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, ch =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
+
+$("c-date").value = new Date().toISOString().slice(0, 10);
+
+async function loadCountVersions() {
+  const sel = $("c-version");
+  try {
+    const res = await fetch("/api/counts/versions");
+    const data = await res.json();
+    if (!res.ok || !data.versions.length) {
+      sel.innerHTML = `<option value="">（${esc((data && data.detail) || "无已发布版本")}）</option>`;
+      return;
+    }
+    sel.innerHTML = data.versions.map(v =>
+      `<option value="${v.id}"${v.id === data.current_version_id ? " selected" : ""}>v${v.id} · ${esc(v.label)}${v.id === data.current_version_id ? "（当前正式版）" : ""}</option>`
+    ).join("");
+    loadCountTrips();
+  } catch (e) { sel.innerHTML = "<option>加载失败</option>"; }
+}
+
+async function loadCountTrips() {
+  const sel = $("c-trip"), date = $("c-date").value, versionId = $("c-version").value;
+  sel.innerHTML = "";
+  if (!date) return;
+  if (!versionId) { sel.innerHTML = "<option value=\"\">（请先选择运行图）</option>"; return; }
+  try {
+    const res = await fetch(`/api/counts/trips?date=${encodeURIComponent(date)}&version_id=${versionId}`);
+    const data = await res.json();
+    if (!res.ok) { sel.innerHTML = `<option value="">（${esc(data.detail || "加载失败")}）</option>`; return; }
+    if (!data.trips.length) { sel.innerHTML = "<option value=\"\">（该运营日没有班次）</option>"; return; }
+    sel.innerHTML = data.trips.map(t => {
+      const badge = t.count_status === "verified" ? " ✔已核验"
+                  : t.count_status === "pending" ? " · 待核" : "";
+      return `<option value="${esc(t.trip_id)}">${esc(t.trip_id)} · ${esc(t.route_short_name || t.route_id)} ${esc(t.trip_headsign || "")}${badge}</option>`;
+    }).join("");
+  } catch (e) { sel.innerHTML = "<option>加载失败</option>"; }
+}
+
+$("c-date").onchange = loadCountTrips;
+$("c-version").onchange = loadCountTrips;
+
+function showCountMsg(html) { $("c-msg").innerHTML = html; }
+
+// 主明细渲染：原值/复点值对照、核验结果、候选站与复点录入、下载
+function renderCountTable(data) {
+  $("c-detail-card").style.display = "block";
+  $("c-detail-title").textContent =
+    `计数明细 · 班次 ${data.trip_id} · ${data.service_date} · v${data.version_id}`;
+  const statusBadge = data.verified
+    ? '<span class="ok">✔ 核验通过</span>'
+    : '<span class="bad">待核（整趟不合规）</span>';
+
+  const rowsHtml = data.rows.map(r => `
+    <tr>
+      <td>${r.stop_sequence}</td>
+      <td>${esc(r.stop_id)}</td>
+      <td>${r.recounted ? `<span class="muted">${r.original_alight} → </span><b>${r.alight}</b>` : r.alight}</td>
+      <td>${r.recounted ? `<span class="muted">${r.original_board} → </span><b>${r.board}</b>` : r.board}</td>
+      <td>${r.recounted ? '<span class="ok">已复点</span>' : ""}</td>
+    </tr>`).join("");
+
+  const issuesHtml = data.issues.length ? `
+    <div class="banner err">整趟核验未通过：</div>
+    <table><tr><th>停站序号</th><th>问题</th></tr>
+      ${data.issues.map(i => `<tr><td>${i.stop_sequence ?? "-"}</td><td>${esc(i.message)}</td></tr>`).join("")}
+    </table>` : '<div class="banner ok">整趟核验通过：始发空车、先下后上、未超载、终点清空。</div>';
+
+  let candidatesHtml = "";
+  if (!data.verified) {
+    if (data.candidates.length) {
+      candidatesHtml = `
+        <h3>可只改本站即可整趟合规的候选站次</h3>
+        <p class="muted">对任一候选站录入实际复点值；整趟核验通过才生效，原值保留供对照。</p>
+        <table>
+          <tr><th>停站序号</th><th>原（下 / 上）</th><th>一组可行值（下 / 上）</th><th>录入实际复点值</th></tr>
+          ${data.candidates.map(c => `<tr>
+            <td>${c.stop_sequence}</td>
+            <td>${c.original_alight} / ${c.original_board}</td>
+            <td>${c.alight} / ${c.board}</td>
+            <td><input type="number" min="0" step="1" id="rc-a-${c.stop_sequence}" value="${c.alight}" style="min-width:70px">
+                <input type="number" min="0" step="1" id="rc-b-${c.stop_sequence}" value="${c.board}" style="min-width:70px">
+                <button class="primary" style="margin:0 0 0 6px;padding:4px 10px"
+                  onclick="submitRecount(${data.table_id}, ${c.stop_sequence})">复点</button></td>
+          </tr>`).join("")}
+        </table>`;
+    } else {
+      candidatesHtml = '<div class="banner err">没有单站可修正的候选，请扩大复核范围（重新核对全表或选择其他班次）。</div>';
+    }
+  }
+
+  const downloadHtml = data.verified
+    ? `<p><a style="display:inline-block;text-decoration:none;border-radius:4px;padding:8px 16px;background:var(--blue);color:#fff"
+         href="/api/counts/${data.table_id}/csv">下载核验通过的计数 CSV</a></p>`
+    : '<p class="muted">只有核验通过的计数表才能下载 CSV。</p>';
+
+  $("c-detail").innerHTML = `
+    <p>状态：${statusBadge} · 核载 ${data.capacity} 人 · 表 #${data.table_id}</p>
+    ${issuesHtml}
+    <table>
+      <tr><th>停站序号</th><th>站点</th><th>下车</th><th>上车</th><th></th></tr>
+      ${rowsHtml}
+    </table>
+    ${downloadHtml}
+    ${candidatesHtml}`;
+}
+
+async function submitRecount(tableId, seq) {
+  const alight = $("rc-a-" + seq).value, board = $("rc-b-" + seq).value;
+  const fd = new FormData();
+  fd.append("stop_sequence", seq);
+  fd.append("alight", alight);
+  fd.append("board", board);
+  const res = await fetch(`/api/counts/${tableId}/recount`, { method: "POST", body: fd });
+  const data = await res.json();
+  if (res.ok) {
+    showCountMsg(`<div class="banner ok">✔ ${esc(data.message)}</div>`);
+    renderCountTable(data);
+  } else {
+    const d = data.detail;
+    const msg = typeof d === "string" ? d
+      : (d && d.message) ? d.message : JSON.stringify(d);
+    let extra = "";
+    if (d && d.issues) extra = `<ul>${d.issues.map(i => `<li>${esc(i.message)}</li>`).join("")}</ul>`;
+    showCountMsg(`<div class="banner err">✘ ${esc(msg)}${extra}（已存记录与原值保持不变）</div>`);
+  }
+}
+
+$("c-load").onclick = async () => {
+  const versionId = $("c-version").value, date = $("c-date").value, trip = $("c-trip").value;
+  if (!versionId || !date || !trip) { showCountMsg('<div class="banner err">请选择运行图、运营日和班次</div>'); return; }
+  const res = await fetch(`/api/counts?version_id=${versionId}&date=${date}&trip_id=${encodeURIComponent(trip)}`);
+  const data = await res.json();
+  if (!res.ok) {
+    $("c-detail-card").style.display = "none";
+    showCountMsg(`<div class="banner err">${esc(typeof data.detail === "string" ? data.detail : "没有已存计数表")}</div>`);
+    return;
+  }
+  showCountMsg("");
+  renderCountTable(data);
+};
+
+$("c-submit").onclick = async () => {
+  const versionId = $("c-version").value, date = $("c-date").value;
+  const trip = $("c-trip").value, capacity = $("c-capacity").value;
+  const file = $("c-file").files[0];
+  if (!versionId || !date || !trip) { showCountMsg('<div class="banner err">请选择运行图、运营日和班次</div>'); return; }
+  if (!capacity || !/^\d+$/.test(capacity) || Number(capacity) <= 0) {
+    showCountMsg('<div class="banner err">核载人数必须为正整数</div>'); return;
+  }
+  if (!file) { showCountMsg('<div class="banner err">请选择逐站计数 CSV</div>'); return; }
+
+  const fd = new FormData();
+  fd.append("version_id", versionId);
+  fd.append("date", date);
+  fd.append("trip_id", trip);
+  fd.append("capacity", capacity);
+  fd.append("counts", file);
+  $("c-submit").disabled = true;
+  try {
+    const res = await fetch("/api/counts", { method: "POST", body: fd });
+    const data = await res.json();
+    if (res.ok) {
+      const cls = data.verified ? "ok" : "err";
+      showCountMsg(`<div class="banner ${cls}">${esc(data.message)}</div>`);
+      renderCountTable(data);
+      loadCountTrips();
+    } else if (res.status === 422 && data.detail && data.detail.errors) {
+      const d = data.detail;
+      showCountMsg(`<div class="banner err">✘ ${esc(d.message)}（共 ${d.error_count} 个格式错误）</div>
+        <table><tr><th>行号</th><th>字段</th><th>错误</th></tr>
+        ${d.errors.map(e => `<tr><td>${e.row ?? "-"}</td><td>${esc(e.field ?? "-")}</td>
+          <td>${esc(e.message)}</td></tr>`).join("")}</table>`);
+    } else {
+      const d = data.detail;
+      showCountMsg(`<div class="banner err">✘ ${esc(typeof d === "string" ? d : JSON.stringify(d))}</div>`);
+    }
+  } finally {
+    $("c-submit").disabled = false;
+  }
+};
 
 loadRoutes();
 </script>
